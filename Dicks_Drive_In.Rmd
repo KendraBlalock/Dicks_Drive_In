@@ -1,0 +1,269 @@
+---
+title: "Dick's-less in Seattle"
+output: html_document
+date: "2024-12-19"
+---
+
+![](Dicks_Drive-In.png)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(dplyr.show_progress = FALSE)
+options(tigris_use_progress = FALSE)
+```
+
+## The Goal
+Recently a question came up at work about the best way to calculate access for an entire state's population to a particular type of medical service available only at specialty clinics. We discussed various options to handle this inquiry, and I decided I wanted to play around with this question on my own. To simplify things, I selected a smaller geographic area, a more narrowed destination list, and calculated only drive times (verses walk, bike, public transport). 
+
+The Seattle region has a beloved local fast-food restaurant called Dick's Drive-In. While there are many other worth burger joints in the area, I must give Dick's props because not only do they deliver a burger and fries that hit the spot at the end of a long night out, they also provide their employees with scholarship opportunities, childcare assistance, healthcare coverage, public transit card, 401k matching, and [more](https://www.ddir.com/employment/). 
+
+Unfortunately, the Dick's Drive-In locations are not evenly distributed for the city, often resulting in neighborhoods eagerly awaiting the announcement of the next opening. I was curious to use this as an example to determine accessibility for those living within the city limits. 
+
+## The Data
+I pulled the population counts for each census block from the US Census Bureau [data portal](https://data.census.gov/). 
+
+The census data was for the entire King County, so I also downloaded the list of census blocks within the city limits from [here](https://data-seattlecitygis.opendata.arcgis.com/datasets/SeattleCityGIS::2020-census-blocks-seattle/about). 
+
+Finally, I manually pulled a list of locations for Dick's Drive-In from this [page](https://www.ddir.com/locations/). I did not include the mobile truck. 
+
+## Data Preparation 
+
+```{r loadlibrarydata}
+#Load libraries
+library(readxl)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(httr)
+library(sf)
+library(ggplot2)
+library(osrm)
+library(stars)
+library(tigris)
+library(ggtext)
+library(waffle)
+
+#Load census block data for King County with population
+king <- readRDS("king_county_blocks.rds")
+
+#Load Seattle city census block list
+seattle_block_list <- st_read("2020_Census_Blocks_-_Seattle.geojson")
+
+#Narrow down King county census blocks to just those in the city of Seattle
+seattle_blocks <- king %>% filter(GEOID %in% (seattle_block_list$GEOID_20))
+
+#Load the locations of Dick's Drive-In
+dicks <- read.csv("Dick's_Addresses.csv")
+
+#Convert points to an sf object 
+dicks2  <- st_as_sf(dicks , coords = c("Longitude", "Latitude"), crs = 4326)
+
+#Transform to NAD83 (EPSG:4269)
+dicks_points <- st_transform(dicks2, st_crs(seattle_blocks))
+
+#Remove original data
+rm(king,seattle_block_list, dicks2)
+
+```
+
+## Overview Map
+
+My first order of business is to map all of the Seattle city blocks as well as all of the Dick's Drive-In in the region, including those outside of the city boundaries. I added the King County boundary lines for reference. 
+
+```{r map1}
+#Get King County level area boundaries
+counties <- tigris::counties(state = "WA",cb = TRUE, class = "sf",progress_bar=F)
+king_county <- counties[counties$NAME == "King", ]
+
+#View blocks with Dick's locations flagged
+ggplot(seattle_blocks) +
+  geom_sf() +
+   geom_sf(data = dicks_points, 
+           color = 'white',
+           fill = "#4537A1", 
+           size = 2,
+           shape=21
+           ) +
+  geom_sf(data = king_county, fill = NA, color = "black", size = 1) +
+  ggtitle("Seattle Census Blocks and <span style='color:#4537A1;'>Dick's Drive-In</span> Locations ") +
+  annotate("text", x = -122.50, y = 47.61, label = "Seattle", size = 5, color = "gray40") + 
+  annotate("text", x = -121.85, y = 47.45, label = "King County", size = 5, fontface = "bold") +
+  theme_void() +
+  theme(
+    plot.title = element_markdown(size = 16, hjust = 0.5, face = "bold")
+    )
+
+```
+
+## Travel Times
+
+Instead of running every residential address, I decided to use the center of each census block as an approximation for all of the residences inside that census block. For driving times the difference within an individual census block would be minimal; not much would be gained by running a more exhaustive address list. 
+
+I ran each census block center latitude and longitude against the latitude and longitude of each of the restaurant locations, using the API to call one row at a time. Once the final results were combined, I selected the shortest travel time for each census block center. 
+
+```{r travel_times}
+#Extract latitude and longitude of the middle of each block from the geometry
+seattle_blocks_point <- seattle_blocks %>%
+  st_centroid() %>% # Convert polygons to centroids
+  mutate(
+    latitude = st_coordinates(.)[, 2],  # Extract latitude
+    longitude = st_coordinates(.)[, 1] # Extract longitude
+  )
+
+#Create an origin table
+origins <- seattle_blocks_point %>% select(GEOID, longitude, latitude) 
+
+travel_times_results <- data.frame(
+  geoid = character(),     
+  location = character(),   
+  time = numeric()    
+)
+
+#Create a destination table
+destinations <- dicks_points %>% select(Location, geometry)
+
+#Use osrmTable to calculate travel times
+#looping through each starting point separately
+#default directions are for travel with car
+for (i in 1:nrow(origins)) {
+  origins2 <- origins[i,]
+  time_result <- osrmTable(src = origins2, dst = destinations)
+  time_result_df <- as.data.frame(time_result$durations) 
+  geoid <- origins2$GEOID
+  wide_df <- cbind(geoid, time_result_df)
+  long_df <- wide_df %>% pivot_longer(!geoid ,names_to = "location", values_to = "time")
+  travel_times_results <- travel_times_results %>% rbind(long_df)
+}
+
+#Select the shortest travel time for each census block 
+shortest <- travel_times_results %>% 
+  group_by(geoid) %>% 
+  summarise(min_drive = min(time)) %>% 
+  ungroup()
+
+#Join min travel time back to main dataset
+seattle_blocks <- seattle_blocks %>% left_join(shortest, by=c('GEOID'='geoid'))
+
+```
+
+Having identified the shortest drive time for each location, I visualized it on a map to get an idea of the spots with lower yummy burger access. 
+
+```{r map2}
+#View blocks with travel times
+seattle_raster <- st_as_stars(seattle_blocks["min_drive"])
+
+ggplot() +
+  geom_stars(data = seattle_raster) +
+  labs(title = "Travel Time by Car to the Nearest Dick's Drive-In",
+        subtitle = "within the Seattle City Limits",
+       fill = "Drive Time (minutes)")+
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  theme_void() +
+  theme(
+    plot.title = element_text(
+      size = 16,     
+      face = "bold", 
+      hjust = 0.5)
+    )
+
+```
+
+## Access by Population
+Population is never evenly distributed, so while some regions of the city may not have as much access to Dick's Drive-In, there may not be as high of a population present. So I wanted to look at travel time by population count. 
+
+```{r population}
+#Bucket the drive times and view by population
+pop_drive <-seattle_blocks %>% select(P1_001N, min_drive) %>% st_drop_geometry()
+
+pop_drive <- pop_drive %>% mutate(binned = case_when(
+  min_drive <= 5 ~ "<5min",
+  min_drive > 5 & min_drive <= 10 ~ "5-10min",
+  min_drive > 10 & min_drive <= 15 ~ "10-15min",
+  min_drive > 15 & min_drive <= 20 ~ "15-20min",
+  min_drive > 20 ~ ">20min"),
+  binned_f = factor(binned, levels= c("<5min", "5-10min", "10-15min","15-20min", ">20min" ))
+  ) 
+
+pop_drive_total <- pop_drive %>% 
+  group_by(binned_f) %>% 
+  summarise(pop = sum(P1_001N)) %>% 
+  ungroup() %>% 
+  mutate(pop10 = round((pop/sum(pop))*100))
+ 
+#Plot using a waffle plot design
+ggplot(pop_drive_total, aes(fill=binned_f, values=pop10)) +
+  geom_waffle(rows=10) +
+  labs(title = "Proportion of Seattle Population and \n Driving Time to Dick's Drive-In",
+       fill = "Drive Time") +
+  coord_equal() +
+  scale_fill_manual(values = c("lightblue", "#81A1CF",'#566BB8',"#2A35A1", "darkblue")) +
+  theme_void()+
+  theme(
+    plot.title = element_text(
+      size = 16,     
+      face = "bold", 
+      hjust = 0.5) 
+    )
+```
+## The Long Road
+
+Purely only out of curiosity, I wanted to map the longest drive that was identified. Coming in at a 25.5 minute one-way venture, I would highly recommend a late night visit as this estimated time will climb steeply during rush hour, any sporting event, or even a slight drizzle. 
+
+```{r map3}
+#Get Seattle city area boundaries
+seattle_boundary <- places(state = "WA", cb = TRUE, year = 2022, progress_bar=F) %>%
+  filter(NAME == "Seattle") 
+
+#View longest travel time route
+start_point <- seattle_blocks_point %>% 
+  left_join(shortest, by=c('GEOID'='geoid')) %>%
+  filter(min_drive == max(seattle_blocks$min_drive, na.rm = T))
+
+dicks_location_longest <- travel_times_results %>% 
+  inner_join(start_point, by = c("geoid"="GEOID")) %>% 
+  filter(time == max(seattle_blocks$min_drive, na.rm = T)) %>% 
+  select(location)
+
+dicks_location_longest <-dicks_location_longest$location
+
+end_point <- dicks_points[dicks_location_longest,]
+
+#Get the route
+route <- osrmRoute(src = start_point, 
+                   dst = end_point, 
+                   overview = "full")
+
+#Convert the route to an sf object (Spatial Features) for ggplot
+route_sf <- st_as_sf(route, coords = c("lon", "lat"), crs = 4326)
+
+#Create the ggplot
+ggplot() +
+  geom_sf(data = seattle_boundary, fill = NA, color = "black", size = 0.8) +  # Seattle border
+  geom_sf(data = route_sf, color = "#4537A1", size = 1.2) +  # Plot the route line
+  geom_sf(data = start_point, color = "lightblue", size = 3) +  # Point A
+  geom_sf(data = end_point, color = "darkblue", size = 3) +  # Point B
+  labs(title = "Route of the Longest Drive to Dick's Drive-In") +
+  annotate("text", x = -122.32, y = 47.725, label = "Seattle", size = 6, color = "gray40")+
+  annotate("text", x = -122.322, y = 47.632, label = "Dick's Drive-In", size = 4, color = "darkblue")+
+    annotate("text", x = -122.34, y = 47.565, label = "25.5min", size = 4, color = "#4537A1")+
+  theme_void() +
+    theme(
+    plot.title = element_text(
+      size = 16,     
+      face = "bold", 
+      hjust = 0.5)
+    )
+
+
+```
+
+So much more exploration could be done. If I had more time, I would love to pull in additional census data and see how their market reach relates to average age or income level. It has been nice to get back to working with ggplot and maps and I look forward to similar projects in the future.  
+
+![](Dicks_Drive-In2.png)
+
+
+
+
+
+
+
